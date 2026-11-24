@@ -1,542 +1,496 @@
 #!/usr/bin/env python3
-"""news-image-20261124: poster of Tuesday 24 November 2026 world news.
+"""news-image-20261124 (rebuild) -- 'The World in One Day: Tuesday 24 November 2026'.
 
-Draws a 1024x1024 newspaper poster with a pure-Python PNG encoder
-(standard library only: zlib, struct, math, os). Deterministic: no
-clock, no randomness, no network, no files read. Writes entry.png to
-/output (or $MAKEFUN_OUTPUT_DIR).
-
-Six stories, each verified as a 24 November 2026 event (happened or
-first reported that day in some time zone, or scheduled for that day
-and labelled as happening today):
-  1. Russian drone briefly enters Polish airspace in a night attack
-     on western Ukraine (Reuters, Nov 24).
-  2. FIFA confirms the 2031 and 2035 Women's World Cup hosts at its
-     Extraordinary Congress, held Tuesday 24 Nov (NZT): a USA-led
-     bid gets 2031, the UK gets 2035.
-  3. World Chess Championship Game 1 begins today in Geneva:
-     Gukesh defends the crown against Sindarov (15:00 CET).
-  4. The Beaver Supermoon peaks today at 14:53 UTC, near the
-     Pleiades - the first supermoon since January.
-  5. Oxfam / CEOBS report: the war has left Gaza's soil, air and
-     water toxic for decades (reported across Asia on 24 Nov).
-  6. Nvidia's board brings Jensen Huang back as CEO; the shares
-     surge about a third (reported in 24 Nov morning papers).
+Draws a 1024x1024 news poster with the Python standard library only.
+The scene is rendered into a 2048x2048 framebuffer and box-downscaled
+by a factor of two, which anti-aliases every edge and keeps the bold
+condensed stroke type legible even at a 300 px viewing width.
+Deterministic: no randomness, no clock, no network.
 """
-import math
+
 import os
 import struct
 import zlib
 
-W, H = 1024, 1024
+# ---------------------------------------------------------------- canvas
 
-# ---------------------------------------------------------------- palette
-PAPER = (247, 243, 230)
-PAPER2 = (238, 232, 214)
-NAVY = (18, 36, 70)
-NAVY2 = (10, 22, 46)
-GOLD = (198, 158, 38)
-GOLD_L = (226, 196, 96)
-INK = (24, 24, 24)
+SS = 2048            # supersampled render size
+OUT = 1024           # final poster size
+
+INK = (22, 32, 44)
+PAPER = (246, 241, 229)
 WHITE = (255, 255, 255)
-MUTE = (96, 104, 116)
-RED = (178, 44, 44)
-GREEN = (46, 125, 50)
-GREEN_L = (120, 190, 95)
-TEAL = (16, 122, 120)
-SKY = (146, 196, 228)
-SKY_D = (38, 74, 110)
-NIGHT = (12, 20, 44)
-MOON = (250, 240, 205)
-CRATER = (214, 198, 150)
-PITCH = (46, 125, 62)
-PITCH2 = (36, 100, 50)
-BROWN = (122, 84, 52)
-SAND = (205, 178, 130)
-TOXIC = (120, 180, 40)
-GREY = (150, 150, 148)
-SMOKE = (120, 120, 118)
+RED = (178, 34, 43)
+GREY = (62, 72, 82)
 
-# ------------------------------------------------------------- 5x7 glyphs
-# One glyph per character: 7 rows of 5 cells, "#" = ink. Authored here
-# from the shapes of the letters themselves.
+buf = bytearray(SS * SS * 3)
+
+
+def px(x, y, rgb):
+    if 0 <= x < SS and 0 <= y < SS:
+        i = (y * SS + x) * 3
+        buf[i] = rgb[0]
+        buf[i + 1] = rgb[1]
+        buf[i + 2] = rgb[2]
+
+
+def fill_rect(x, y, w, h, rgb):
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(SS, int(x + w))
+    y1 = min(SS, int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    row = bytes(rgb) * (x1 - x0)
+    n = len(row)
+    for yy in range(y0, y1):
+        i = (yy * SS + x0) * 3
+        buf[i:i + n] = row
+
+
+def fill_circle(cx, cy, r, rgb):
+    r = int(r)
+    cx = int(cx)
+    cy = int(cy)
+    for yy in range(cy - r, cy + r + 1):
+        dy = yy - cy
+        rem = r * r - dy * dy
+        if rem < 0:
+            continue
+        dx = int(rem ** 0.5)
+        fill_rect(cx - dx, yy, dx * 2 + 1, 1, rgb)
+
+
+def thick_line(x0, y0, x1, y1, width, rgb):
+    """A line drawn as a chain of stamped discs (round caps and joins)."""
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = max(abs(dx), abs(dy))
+    steps = max(1, int(dist / max(2.0, width * 0.30)))
+    r = width / 2.0
+    for s in range(steps + 1):
+        t = s / steps
+        fill_circle(x0 + dx * t, y0 + dy * t, r, rgb)
+
+
+def poly(points, width, rgb):
+    for a, b in zip(points, points[1:]):
+        thick_line(a[0], a[1], b[0], b[1], width, rgb)
+
+
+def outline_rect(x, y, w, h, width, rgb):
+    fill_rect(x, y, w, width, rgb)
+    fill_rect(x, y + h - width, w, width, rgb)
+    fill_rect(x, y, width, h, rgb)
+    fill_rect(x + w - width, y, width, h, rgb)
+
+
+# ---------------------------------------------------------------- type
+# A bold condensed stroke alphabet on a 5 x 7 grid (y grows downward).
+# Strokes are drawn thick at supersample resolution, then downscaled,
+# so the letterforms stay smooth and readable at small sizes.
+
 GLYPHS = {
-    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
-    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
-    "C": ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
-    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
-    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
-    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
-    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
-    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
-    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
-    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
-    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
-    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
-    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
-    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
-    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
-    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
-    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
-    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
-    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
-    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
-    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
-    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
-    "W": ("10001", "10001", "10001", "10101", "10101", "11011", "10001"),
-    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
-    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
-    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
-    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
-    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
-    "2": ("01110", "10001", "00001", "00110", "01000", "10000", "11111"),
-    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
-    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
-    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
-    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
-    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
-    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
-    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
-    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
-    "-": ("00000", "00000", "00000", "01110", "00000", "00000", "00000"),
-    ".": ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
-    ",": ("00000", "00000", "00000", "00000", "01100", "00100", "01000"),
-    "'": ("00100", "00100", "01000", "00000", "00000", "00000", "00000"),
-    ":": ("00000", "01100", "01100", "00000", "01100", "01100", "00000"),
-    ";": ("00000", "01100", "01100", "00000", "01100", "00100", "01000"),
-    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
-    "(": ("00010", "00100", "01000", "01000", "01000", "00100", "00010"),
-    ")": ("01000", "00100", "00010", "00010", "00010", "00100", "01000"),
-    "%": ("11001", "11010", "00010", "00100", "01000", "01011", "10011"),
-    "&": ("01100", "10010", "10100", "01000", "10101", "10010", "01101"),
-    "+": ("00000", "00100", "00100", "01110", "00100", "00100", "00000"),
-    "!": ("00100", "00100", "00100", "00100", "00100", "00000", "00100"),
-    "?": ("01110", "10001", "00001", "00110", "00100", "00000", "00100"),
-    "=": ("00000", "00000", "11111", "00000", "11111", "00000", "00000"),
-    "*": ("00000", "10101", "01110", "11111", "01110", "10101", "00000"),
+    "A": [[(0, 7), (2.5, 0), (5, 7)], [(1.2, 4.6), (3.8, 4.6)]],
+    "B": [[(0, 0), (0, 7)], [(0, 0), (2.8, 0), (4, 1.2), (4, 2.3), (2.8, 3.4), (0, 3.4)],
+          [(2.8, 3.4), (4.2, 4.4), (4.2, 5.8), (2.8, 7), (0, 7)]],
+    "C": [[(4.6, 1.2), (3, 0.2), (1.2, 0.6), (0.2, 2.2), (0.2, 4.8), (1.2, 6.4), (3, 6.8), (4.6, 5.8)]],
+    "D": [[(0, 0), (0, 7)], [(0, 0), (2.6, 0), (4.2, 1.6), (4.2, 5.4), (2.6, 7), (0, 7)]],
+    "E": [[(4.6, 0), (0, 0), (0, 7), (4.6, 7)], [(0, 3.4), (3.8, 3.4)]],
+    "F": [[(4.6, 0), (0, 0), (0, 7)], [(0, 3.4), (3.6, 3.4)]],
+    "G": [[(4.6, 1.2), (3, 0.2), (1.2, 0.6), (0.2, 2.2), (0.2, 4.8), (1.2, 6.4), (3, 6.8), (4.6, 6.2), (4.6, 4), (2.8, 4)]],
+    "H": [[(0, 0), (0, 7)], [(5, 0), (5, 7)], [(0, 3.5), (5, 3.5)]],
+    "I": [[(2.5, 0), (2.5, 7)], [(0.6, 0), (4.4, 0)], [(0.6, 7), (4.4, 7)]],
+    "J": [[(4.6, 0), (4.6, 5.4), (3.4, 6.8), (1.4, 6.8), (0.2, 5.6)]],
+    "K": [[(0, 0), (0, 7)], [(4.6, 0), (0.4, 3.4)], [(1.6, 2.6), (4.6, 7)]],
+    "L": [[(0, 0), (0, 7), (4.6, 7)]],
+    "M": [[(0, 7), (0, 0), (2.5, 3.2), (5, 0), (5, 7)]],
+    "N": [[(0, 7), (0, 0), (5, 7), (5, 0)]],
+    "O": [[(1.2, 0.6), (3, 0), (4.4, 1.4), (4.6, 3.5), (4.4, 5.6), (3, 7), (1.6, 7), (0.4, 5.6), (0.2, 3.5), (0.4, 1.4), (1.2, 0.6)]],
+    "P": [[(0, 7), (0, 0), (3, 0), (4.4, 1.2), (4.4, 2.6), (3, 3.8), (0, 3.8)]],
+    "Q": [[(1.2, 0.6), (3, 0), (4.4, 1.4), (4.6, 3.5), (4.4, 5.6), (3, 7), (1.6, 7), (0.4, 5.6), (0.2, 3.5), (0.4, 1.4), (1.2, 0.6)],
+          [(2.8, 4.8), (4.8, 7.2)]],
+    "R": [[(0, 7), (0, 0), (3, 0), (4.4, 1.2), (4.4, 2.6), (3, 3.8), (0, 3.8)], [(2.4, 3.8), (4.6, 7)]],
+    "S": [[(4.4, 1.2), (2.8, 0.2), (1, 0.8), (0.6, 2.2), (1.6, 3.2), (3.6, 3.8), (4.4, 5), (3.8, 6.4), (2, 6.9), (0.4, 6)]],
+    "T": [[(0, 0), (5, 0)], [(2.5, 0), (2.5, 7)]],
+    "U": [[(0, 0), (0, 5.2), (1, 6.6), (3, 6.9), (4.2, 6.4), (5, 5.2), (5, 0)]],
+    "V": [[(0, 0), (2.5, 7), (5, 0)]],
+    "W": [[(0, 0), (1, 7), (2.5, 2.6), (4, 7), (5, 0)]],
+    "X": [[(0, 0), (5, 7)], [(5, 0), (0, 7)]],
+    "Y": [[(0, 0), (2.5, 3.2), (5, 0)], [(2.5, 3.2), (2.5, 7)]],
+    "Z": [[(0, 0), (5, 0), (0, 7), (5, 7)]],
+    "0": [[(1.4, 0.4), (3.2, 0), (4.4, 1.2), (4.6, 3.5), (4.4, 5.8), (3.2, 7), (1.4, 6.6), (0.4, 5.4), (0.2, 3.5), (0.4, 1.6), (1.4, 0.4)]],
+    "1": [[(1.2, 1.4), (2.8, 0), (2.8, 7)], [(0.8, 7), (4.4, 7)]],
+    "2": [[(0.4, 1.6), (1.2, 0.4), (3, 0.2), (4.4, 1.4), (4.2, 2.8), (0.2, 7), (4.6, 7)]],
+    "3": [[(0.4, 1), (1.6, 0.2), (3.4, 0.4), (4.2, 1.6), (3.4, 3), (1.8, 3.2)],
+          [(3.4, 3), (4.4, 4.2), (4, 6), (2.6, 6.9), (0.6, 6.2)]],
+    "4": [[(3.4, 7), (3.4, 0), (0, 4.8), (5, 4.8)]],
+    "5": [[(4.4, 0), (0.6, 0), (0.4, 3), (2.8, 2.8), (4.4, 4.2), (4, 6), (2.4, 6.9), (0.4, 6)]],
+    "6": [[(4.2, 1.2), (2.6, 0.2), (1, 1), (0.2, 3.4), (0.4, 5.6), (1.6, 6.8), (3.2, 6.8), (4.4, 5.6), (4.4, 4), (3, 3.2), (0.6, 3.6)]],
+    "7": [[(0.2, 0), (4.8, 0), (2.2, 7)]],
+    "8": [[(1.6, 3.3), (0.8, 2.6), (0.8, 1.2), (2, 0.2), (3.6, 0.2), (4.4, 1.2), (4.4, 2.6), (3.4, 3.3), (1.6, 3.3)],
+          [(1.6, 3.3), (0.6, 4.4), (0.8, 6), (2, 6.9), (3.8, 6.9), (4.6, 6), (4.4, 4.4), (3.4, 3.3)]],
+    "9": [[(0.6, 5.8), (2.4, 6.8), (4, 6), (4.8, 3.6), (4.6, 1.4), (3.4, 0.2), (1.8, 0.2), (0.6, 1.4), (0.6, 2.8), (2, 3.8), (4.4, 3.4)]],
+    ",": [[(2.8, 6.0), (2.1, 7.4)]],
+    ":": [],
+    ";": [[(2.8, 6.0), (2.1, 7.4)]],
+    "'": [[(2.5, 0), (2.3, 1.6)]],
+    "-": [[(0.8, 3.5), (4.2, 3.5)]],
+    "+": [[(0.8, 3.5), (4.2, 3.5)], [(2.5, 1.8), (2.5, 5.2)]],
+    "/": [[(4.6, 0), (0.4, 7)]],
 }
 
+DOTS = {  # punctuation drawn as filled dots: char -> [(gx, gy), ...]
+    ".": [(2.5, 6.6)],
+    ":": [(2.5, 1.6), (2.5, 5.6)],
+    ";": [(2.5, 1.6)],
+    "·": [(2.5, 3.5)],
+}
 
-def glyph_width(text, scale):
-    """Pixel width of text at the given scale (1 blank column per glyph)."""
-    return len(text) * 6 * scale - scale if text else 0
+XSCALE = 0.72          # horizontal condensation of the letterforms
+ADVANCE = 4.4          # glyph advance, in grid units
 
 
-class Poster:
-    """An RGB pixel buffer with small drawing helpers."""
+def text_width(text, cap):
+    unit = cap / 7.0
+    return len(text) * ADVANCE * unit
 
-    def __init__(self, w, h, bg):
-        self.w, self.h = w, h
-        self.buf = bytearray(w * h * 3)
-        self.cx0, self.cy0, self.cx1, self.cy1 = 0, 0, w, h
-        self.fill(0, 0, w, h, bg)
 
-    def set_clip(self, x, y, w, h):
-        self.cx0, self.cy0 = max(0, x), max(0, y)
-        self.cx1, self.cy1 = min(self.w, x + w), min(self.h, y + h)
+def draw_text(x, y, text, cap, rgb):
+    """Draw text with its cap-height top at y. Returns the drawn width."""
+    unit = cap / 7.0
+    width = max(3.0, cap * 0.17)
+    cx = float(x)
+    for ch in text:
+        if ch == "%":
+            for (gx, gy) in ((1.05, 1.15), (3.95, 5.85)):
+                pts = []
+                for k in range(13):
+                    ang = k * 0.5236
+                    pts.append((cx + (gx + 0.9 * _cos(ang)) * unit * XSCALE,
+                                y + (gy + 0.9 * _sin(ang)) * unit))
+                poly(pts, width, rgb)
+            thick_line(cx + 4.6 * unit * XSCALE, y, cx + 0.4 * unit * XSCALE,
+                       y + 7 * unit, width, rgb)
+        elif ch in DOTS:
+            for (gx, gy) in DOTS[ch]:
+                fill_circle(cx + gx * unit * XSCALE, y + gy * unit,
+                            width * 0.66, rgb)
+        elif ch in GLYPHS:
+            for stroke in GLYPHS[ch]:
+                pts = [(cx + gx * unit * XSCALE, y + gy * unit)
+                       for (gx, gy) in stroke]
+                if len(pts) == 1:
+                    fill_circle(pts[0][0], pts[0][1], width * 0.66, rgb)
+                else:
+                    poly(pts, width, rgb)
+        cx += ADVANCE * unit
+    return cx - x
 
-    def clear_clip(self):
-        self.cx0, self.cy0, self.cx1, self.cy1 = 0, 0, self.w, self.h
 
-    def px(self, x, y, c):
-        if self.cx0 <= x < self.cx1 and self.cy0 <= y < self.cy1:
-            i = (y * self.w + x) * 3
-            self.buf[i], self.buf[i + 1], self.buf[i + 2] = c
+def _sin(a):
+    # tiny deterministic trig table-free helpers (math is stdlib too,
+    # but keeping them local makes the intent obvious)
+    import math
+    return math.sin(a)
 
-    def fill(self, x, y, w, h, c):
-        x0, y0 = max(self.cx0, x), max(self.cy0, y)
-        x1, y1 = min(self.cx1, x + w), min(self.cy1, y + h)
-        for yy in range(y0, y1):
-            base = (yy * self.w + x0) * 3
-            for xx in range(x0, x1):
-                i = base + (xx - x0) * 3
-                self.buf[i], self.buf[i + 1], self.buf[i + 2] = c
 
-    def hline(self, x, y, w, c, t=1):
-        self.fill(x, y, w, t, c)
+def _cos(a):
+    import math
+    return math.cos(a)
 
-    def vline(self, x, y, h, c, t=1):
-        self.fill(x, y, t, h, c)
 
-    def line(self, x0, y0, x1, y1, c, t=1):
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err, x, y = dx - dy, x0, y0
-        while True:
-            self.fill(x - t // 2, y - t // 2, t, t, c)
-            if x == x1 and y == y1:
-                return
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
+def draw_centered(cx, y, text, cap, rgb):
+    w = text_width(text, cap)
+    draw_text(cx - w / 2.0, y, text, cap, rgb)
+    return w
 
-    def disc(self, cx, cy, r, c):
-        for yy in range(cy - r, cy + r + 1):
-            half = int(math.sqrt(max(0, r * r - (yy - cy) ** 2)))
-            self.fill(cx - half, yy, half * 2 + 1, 1, c)
 
-    def ring(self, cx, cy, r, c, t=2):
-        for yy in range(cy - r, cy + r + 1):
-            dx = int(math.sqrt(max(0, r * r - (yy - cy) ** 2)))
-            self.fill(cx - dx, yy, t, 1, c)
-            self.fill(cx + dx - t + 1, yy, t, 1, c)
-        for xx in range(cx - r, cx + r + 1):
-            dy = int(math.sqrt(max(0, r * r - (xx - cx) ** 2)))
-            self.fill(xx, cy - dy, 1, t, c)
-            self.fill(xx, cy + dy - t + 1, 1, t, c)
-
-    def tri(self, x0, y0, x1, y1, x2, y2, c):
-        ymin, ymax = min(y0, y1, y2), max(y0, y1, y2)
-        for yy in range(ymin, ymax + 1):
-            xs = []
-            for (ax, ay, bx, by) in ((x0, y0, x1, y1), (x1, y1, x2, y2),
-                                     (x2, y2, x0, y0)):
-                if ay == by:
-                    continue
-                if min(ay, by) <= yy < max(ay, by):
-                    xs.append(ax + (yy - ay) * (bx - ax) / (by - ay))
-            if len(xs) >= 2:
-                self.fill(int(min(xs)), yy, int(max(xs)) - int(min(xs)) + 1, 1, c)
-
-    def text(self, x, y, s, scale, c, align="left", heavy=False):
-        """Draw ASCII text; y is the top row. Returns the drawn width."""
-        if align == "center":
-            x -= glyph_width(s, scale) // 2
-        elif align == "right":
-            x -= glyph_width(s, scale)
-        extra = (0, max(1, scale // 3)) if heavy else (0,)
-        for ox in extra:
-            cx = x + ox
-            for ch in s:
-                g = GLYPHS.get(ch.upper(), GLYPHS[" "])
-                for row in range(7):
-                    bits = g[row]
-                    for col in range(5):
-                        if bits[col] == "1":
-                            self.fill(cx + col * scale, y + row * scale,
-                                      scale, scale, c)
-                cx += 6 * scale
-        return glyph_width(s, scale)
-
-    def wrapped(self, x, y, s, scale, c, max_w, leading):
-        """Word-wrap text inside max_w; returns the y after the last line."""
-        words, lines, cur = s.split(" "), [], ""
-        for wd in words:
-            trial = (cur + " " + wd).strip()
-            if glyph_width(trial, scale) <= max_w or not cur:
-                cur = trial
-            else:
-                lines.append(cur)
-                cur = wd
-        if cur:
+def wrap(text, cap, max_width):
+    """Greedy word wrap using the real advance of the stroke font."""
+    lines = []
+    cur = ""
+    for word in text.split(" "):
+        trial = word if not cur else cur + " " + word
+        if cur and text_width(trial, cap) > max_width:
             lines.append(cur)
-        for ln in lines:
-            self.text(x, y, ln, scale, c)
-            y += leading
-        return y
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines
 
 
-def chunk(kind, data):
-    body = kind + data
-    return (struct.pack(">I", len(data)) + body +
-            struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+# ---------------------------------------------------------------- layout
+
+MARGIN = 44
+CONTENT_W = SS - 2 * MARGIN
 
 
-def write_png(poster, path):
-    raw = bytearray()
-    for yy in range(poster.h):
-        raw.append(0)
-        raw += poster.buf[yy * poster.w * 3:(yy + 1) * poster.w * 3]
-    ihdr = struct.pack(">IIBBBBB", poster.w, poster.h, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-           chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
-    with open(path, "wb") as f:
-        f.write(png)
-    return len(png)
+def masthead():
+    y = 36
+    draw_centered(SS / 2, y, "THE WORLD IN ONE DAY", 44, RED)
+    y += 66
+    fill_rect(MARGIN, y, CONTENT_W, 6, INK)
+    y += 22
+    draw_centered(SS / 2, y, "TUESDAY", 190, INK)
+    y += 232
+    draw_centered(SS / 2, y, "24 NOVEMBER 2026", 88, RED)
+    y += 118
+    fill_rect(MARGIN, y, CONTENT_W, 6, INK)
+    return y + 24
 
 
-# ------------------------------------------------------------------- panels
-# Each panel: picture band (top), headline, body lines. Geometry:
-# panel w=322, picture h=180, headline scale 3, body scale 2.
-
-def panel_frame(p, x, y, w, h, accent):
-    p.fill(x, y, w, h, WHITE)
-    p.fill(x, y, w, 5, accent)
-    for t in range(2):
-        p.hline(x, y + t, w, INK)
-        p.hline(x, y + h - 1 - t, w, INK)
-        p.vline(x + t, y, h, INK)
-        p.vline(x + w - 1 - t, y, h, INK)
-
-
-def panel_text(p, x, y, w, tag, head, body, accent):
-    """Tag line, headline (scale 3) and body (scale 2) under the picture."""
-    ty = y + 186
-    p.text(x + 12, ty, tag, 2, accent, heavy=True)
-    hy = ty + 22
-    hy = p.wrapped(x + 12, hy, head, 3, INK, w - 24, 26)
-    p.wrapped(x + 12, hy + 4, body, 2, MUTE, w - 24, 17)
+def footer(y):
+    fill_rect(MARGIN, y, CONTENT_W, 6, INK)
+    y += 22
+    draw_text(MARGIN, y, "ALSO TODAY:", 48, RED)
+    y += 64
+    draw_text(MARGIN, y,
+              "FRANCE: OFFICER FACES MURDER TRIAL OVER NAHEL SHOOTING",
+              48, INK)
+    y += 64
+    draw_text(MARGIN, y,
+              "UAE CRASH KILLS 11 · SHENZHOU-24 CREW UNVEILED IN CHINA",
+              48, INK)
+    return y + 66
 
 
-def art_drone(p, x, y, w, h):
-    """Night sky over Ukraine, a drone crossing a dashed border."""
-    p.fill(x, y, w, h, NIGHT)
-    for sx, sy in ((30, 26), (90, 60), (150, 18), (210, 48), (260, 22),
-                   (60, 96), (180, 88), (290, 90), (120, 40)):
-        p.disc(x + sx, y + sy, 2, WHITE)
-    # radar arcs bottom-left
-    for r in (34, 58, 82):
-        p.ring(x + 40, y + h - 10, r, TEAL, 2)
-    p.line(x + 40, y + h - 10, x + 40 + 58, y + h - 10 - 58, TEAL, 2)
-    # dashed border, vertical, with Polish flag marker
-    for yy in range(y + 8, y + h - 8, 14):
-        p.fill(x + 210, yy, 4, 8, GOLD)
-    p.fill(x + 196, y + 20, 32, 12, WHITE)
-    p.fill(x + 196, y + 32, 32, 12, RED)
-    # drone: light-grey body, four arms, red light (visible on night sky)
-    dx, dy = x + 150, y + 70
-    p.fill(dx - 26, dy - 4, 52, 8, (170, 170, 170))
-    p.fill(dx - 6, dy - 12, 12, 24, (120, 120, 120))
-    p.fill(dx - 34, dy - 10, 10, 3, WHITE)
-    p.fill(dx + 24, dy - 10, 10, 3, WHITE)
-    p.fill(dx - 34, dy + 7, 10, 3, WHITE)
-    p.fill(dx + 24, dy + 7, 10, 3, WHITE)
-    p.disc(dx, dy, 4, RED)
-    # ground silhouette
-    p.fill(x, y + h - 26, w, 26, (8, 14, 30))
-    p.tri(x + 30, y + h - 26, x + 70, y + h - 26, x + 50, y + h - 52, (8, 14, 30))
-    p.tri(x + 230, y + h - 26, x + 290, y + h - 26, x + 260, y + h - 58, (8, 14, 30))
+# ---------------------------------------------------------------- art
+# Simple bold flat illustrations, one per panel, drawn inside the
+# panel's coloured strip.  All coordinates are relative to the strip.
+
+def art_ukraine(sx, sy, sw, sh):
+    dark = (52, 66, 84)
+    base = sy + sh
+    for i, (bw, bh) in enumerate(((120, 44), (100, 60), (130, 38))):
+        bx = sx + 500 + i * 128
+        fill_rect(bx, base - bh, bw, bh, dark)
+        for wy in range(int(base - bh) + 9, int(base) - 10, 17):
+            for wx in range(int(bx) + 11, int(bx + bw) - 13, 24):
+                fill_rect(wx, wy, 10, 8, (250, 205, 92))
+    # burst over the middle block
+    cx, cy = sx + 500 + 128 + 50, base - 52
+    for dx, dy in ((-38, -18), (0, -28), (38, -18), (-28, 12), (32, 10)):
+        thick_line(cx, cy, cx + dx, cy + dy, 7, (232, 116, 32))
+    fill_circle(cx, cy, 12, (245, 166, 35))
 
 
-def art_worldcup(p, x, y, w, h):
-    """Green pitch, a ball and a gold cup, two small flags."""
-    p.fill(x, y, w, h, PITCH)
-    for i in range(0, w, 44):
-        p.fill(x + i, y, 22, h, PITCH2)
-    p.hline(x, y + h // 2, w, WHITE, 3)
-    p.ring(x + w // 2, y + h // 2, 34, WHITE, 3)
-    p.fill(x + 8, y + 8, w - 16, 3, WHITE)
-    p.fill(x + 8, y + h - 11, w - 16, 3, WHITE)
-    # football
-    bx, by = x + 78, y + 88
-    p.disc(bx, by, 30, WHITE)
-    p.disc(bx, by, 30, WHITE)
-    p.disc(bx - 8, by - 8, 6, INK)
-    p.disc(bx + 12, by + 6, 5, INK)
-    p.disc(bx - 2, by + 14, 5, INK)
-    p.disc(bx + 8, by - 14, 4, INK)
-    # gold trophy
-    tx, ty = x + 218, y + 46
-    p.fill(tx - 26, ty, 52, 10, GOLD)
-    p.fill(tx - 20, ty + 10, 40, 26, GOLD_L)
-    p.fill(tx - 6, ty + 36, 12, 22, GOLD)
-    p.fill(tx - 20, ty + 58, 40, 8, GOLD)
-    p.fill(tx - 30, ty + 2, 8, 18, GOLD)
-    p.fill(tx + 22, ty + 2, 8, 18, GOLD)
-    # small flags: USA stripes, UK cross
-    fx, fy = x + 196, y + 128
-    for i in range(5):
-        p.fill(fx, fy + i * 6, 44, 3, RED if i % 2 == 0 else WHITE)
-    p.fill(fx, fy, 18, 16, NAVY)
-    ux, uy = x + 250, y + 128
-    p.fill(ux, uy, 44, 30, NAVY)
-    p.fill(ux + 18, uy, 8, 30, WHITE)
-    p.fill(ux, uy + 11, 44, 8, WHITE)
-    p.fill(ux + 20, uy, 4, 30, RED)
-    p.fill(ux, uy + 13, 44, 4, RED)
+def art_gaza(sx, sy, sw, sh):
+    base = sy + sh
+    ruin = (110, 96, 84)
+    heights = (40, 58, 28, 48, 22, 42)
+    x = sx + 440
+    for i, hh in enumerate(heights):
+        bw = 72 if i % 2 == 0 else 56
+        fill_rect(x, base - hh, bw, hh, ruin)
+        if i % 3 == 1:  # a leaning, broken slab
+            thick_line(x + 6, base - hh, x + bw - 12, base - hh + 16, 8, ruin)
+        x += bw + 14
+    for i in range(3):  # smoke
+        fill_circle(sx + 520 + i * 120, sy + 18 - (i % 2) * 5, 12 - i, (168, 160, 148))
+        fill_circle(sx + 538 + i * 120, sy + 27 - (i % 2) * 5, 9 - i, (178, 170, 158))
 
 
-def art_chess(p, x, y, w, h):
-    """Checkerboard with a white king and a black king facing off."""
-    p.fill(x, y, w, h, SAND)
-    sq = 40
-    ox, oy = x + 22, y + 14
-    for r in range(4):
-        for c in range(4):
-            if (r + c) % 2 == 0:
-                p.fill(ox + c * sq, oy + r * sq, sq, sq, (240, 222, 190))
-            else:
-                p.fill(ox + c * sq, oy + r * sq, sq, sq, (96, 64, 40))
-    for t in range(2):
-        p.hline(ox, oy + t, 160, INK)
-        p.hline(ox, oy + 160 - 1 - t, 160, INK)
-        p.vline(ox + t, oy, 160, INK)
-        p.vline(ox + 160 - 1 - t, oy, 160, INK)
-    # white king (left), black king (right)
-    kx, ky = x + 210, y + 40
-    p.fill(kx + 8, ky + 44, 44, 10, WHITE)
-    p.fill(kx + 14, ky + 10, 32, 34, WHITE)
-    p.tri(kx + 14, ky + 12, kx + 30, ky - 8, kx + 46, ky + 12, WHITE)
-    p.disc(kx + 30, ky - 8, 4, GOLD)
-    p.fill(kx + 27, ky - 18, 6, 10, GOLD)
-    bx, by = x + 262, y + 96
-    p.fill(bx + 8, by + 44, 44, 10, INK)
-    p.fill(bx + 14, by + 10, 32, 34, INK)
-    p.tri(bx + 14, by + 12, bx + 30, by - 8, bx + 46, by + 12, INK)
-    p.disc(bx + 30, by - 8, 4, GOLD)
-    p.fill(bx + 27, by - 18, 6, 10, GOLD)
+def art_solomons(sx, sy, sw, sh):
+    green = (58, 138, 84)
+    cy = sy + sh * 0.60
+    for cx, r in ((sx + sw * 0.60, 44), (sx + sw * 0.66, 32), (sx + sw * 0.86, 38), (sx + sw * 0.91, 26)):
+        fill_circle(cx, cy, r * 0.52, green)
+        fill_circle(cx - r * 0.5, cy + 3, r * 0.36, green)
+        fill_circle(cx + r * 0.5, cy + 3, r * 0.36, green)
+    # a bold arrow of change sweeping between the two island groups
+    pts = [(sx + sw * (0.66 + t * 0.14), cy - 34 + 22 * (t - 0.5) ** 2 * 4 - 22)
+           for t in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    poly(pts, 9, WHITE)
+    hx, hy = pts[-1]
+    poly([(hx - 20, hy - 3), (hx + 3, hy + 1), (hx - 15, hy + 15)], 9, WHITE)
 
 
-def art_moon(p, x, y, w, h):
-    """Beaver Supermoon over a dark horizon, Pleiades beside it."""
-    p.fill(x, y, w, h, NIGHT)
-    for sx, sy, r in ((28, 24, 2), (70, 48, 1), (120, 20, 2), (280, 60, 2),
-                      (250, 26, 1), (40, 90, 1), (300, 110, 2), (150, 96, 1)):
-        p.disc(x + sx, y + sy, r, WHITE)
-    # Pleiades cluster, upper right
-    for px, py, r in ((252, 34, 3), (268, 28, 2), (280, 40, 3), (262, 48, 2),
-                      (246, 50, 2), (274, 56, 2), (258, 62, 1)):
-        p.disc(x + px, y + py, r, WHITE)
-    # the moon
-    mx, my, mr = x + 118, y + 92, 58
-    p.disc(mx, my, mr, MOON)
-    p.disc(mx - 22, my - 14, 10, CRATER)
-    p.disc(mx + 18, my + 6, 13, CRATER)
-    p.disc(mx + 4, my - 28, 7, CRATER)
-    p.disc(mx - 6, my + 24, 8, CRATER)
-    p.disc(mx + 28, my - 22, 5, CRATER)
-    # horizon with pines
-    p.fill(x, y + h - 22, w, 22, (6, 12, 26))
-    for tx in (36, 70, 230, 268, 296):
-        p.tri(x + tx, y + h - 22, x + tx + 22, y + h - 22,
-              x + tx + 11, y + h - 56, (6, 12, 26))
+def art_markets(sx, sy, sw, sh):
+    base = sy + sh - 8
+    green = (34, 139, 76)
+    for i, bh in enumerate((16, 26, 36, 50)):
+        fill_rect(sx + 500 + i * 104, base - bh, 62, bh, green)
+    pts = [(sx + 520, base - 30), (sx + 624, base - 42), (sx + 728, base - 40),
+           (sx + 850, base - 62)]
+    poly(pts, 10, RED)
+    hx, hy = pts[-1]
+    poly([(hx - 28, hy + 2), (hx + 5, hy - 3), (hx - 5, hy + 24)], 10, RED)
 
 
-def art_gaza(p, x, y, w, h):
-    """Cracked, poisoned ground under a smoke sky; warning triangle."""
-    p.fill(x, y, w, h, (196, 188, 168))
-    # smoke puffs
-    for sx, sy, r in ((50, 34, 16), (90, 24, 20), (140, 36, 14),
-                      (230, 30, 18), (270, 40, 12)):
-        p.disc(x + sx, y + sy, r, SMOKE)
-    # cracked earth
-    p.fill(x, y + 78, w, h - 78, BROWN)
-    p.line(x + 20, y + 78, x + 90, y + 130, (70, 46, 26), 3)
-    p.line(x + 90, y + 130, x + 60, y + h - 6, (70, 46, 26), 3)
-    p.line(x + 200, y + 78, x + 160, y + 140, (70, 46, 26), 3)
-    p.line(x + 160, y + 140, x + 230, y + h - 10, (70, 46, 26), 3)
-    p.line(x + 120, y + 78, x + 130, y + 120, (70, 46, 26), 2)
-    # toxic pools
-    p.disc(x + 250, y + 140, 16, TOXIC)
-    p.disc(x + 60, y + 160, 12, TOXIC)
-    # warning triangle with exclamation (point up)
-    tx, ty = x + 138, y + 84
-    p.tri(tx + 46, ty, tx, ty + 66, tx + 92, ty + 66, (255, 214, 0))
-    p.fill(tx + 43, ty + 18, 6, 26, INK)
-    p.fill(tx + 43, ty + 50, 6, 6, INK)
-    # water drop, contaminated
-    dx, dy = x + 268, y + 96
-    p.disc(dx, dy, 12, (40, 110, 180))
-    p.tri(dx - 12, dy - 2, dx + 12, dy - 2, dx, dy - 26, (40, 110, 180))
-    p.disc(dx - 4, dy + 2, 3, WHITE)
+def art_health(sx, sy, sw, sh):
+    cx, cy = sx + 610, sy + sh / 2
+    for k in range(8):
+        ang = k * 0.7854
+        x2 = cx + 38 * _cos(ang)
+        y2 = cy + 38 * _sin(ang)
+        thick_line(cx, cy, x2, y2, 7, RED)
+        fill_circle(x2, y2, 7, RED)
+    fill_circle(cx, cy, 25, RED)
+    fill_circle(cx - 8, cy - 7, 5, WHITE)
+    fill_circle(cx + 9, cy + 5, 4, WHITE)
+    # medical cross badge
+    bx, by = sx + sw - 90, cy
+    fill_circle(bx, by, 27, (34, 120, 160))
+    fill_rect(bx - 6, by - 16, 12, 32, WHITE)
+    fill_rect(bx - 16, by - 6, 32, 12, WHITE)
 
 
-def art_nvidia(p, x, y, w, h):
-    """A chip and a steeply rising chart on a dark board."""
-    p.fill(x, y, w, h, NAVY2)
-    # grid
-    for gx in range(x + 20, x + w - 10, 40):
-        p.vline(gx, y + 10, h - 20, (28, 48, 84), 1)
-    for gy in range(y + 16, y + h - 10, 30):
-        p.hline(x + 10, gy, w - 20, (28, 48, 84), 1)
-    # chip, left
-    cx, cy = x + 34, y + 96
-    for i in range(5):
-        p.fill(cx - 8, cy + 8 + i * 10, 8, 4, GOLD)
-        p.fill(cx + 52, cy + 8 + i * 10, 8, 4, GOLD)
-    p.fill(cx, cy, 52, 52, (16, 28, 56))
-    p.fill(cx + 4, cy + 4, 44, 44, (30, 52, 96))
-    p.text(cx + 12, cy + 16, "NV", 3, (118, 200, 90), heavy=True)
-    # rising chart, right
-    pts = [(x + 110, y + 150), (x + 150, y + 138), (x + 180, y + 142),
-           (x + 215, y + 108), (x + 250, y + 96), (x + 290, y + 52)]
-    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
-        p.line(ax, ay, bx, by, (118, 200, 90), 4)
-    for (px, py) in pts:
-        p.disc(px, py, 4, (118, 200, 90))
-    # arrow head at the top
-    p.line(x + 290, y + 52, x + 272, y + 56, (118, 200, 90), 4)
-    p.line(x + 290, y + 52, x + 286, y + 72, (118, 200, 90), 4)
-    p.text(x + 108, y + 22, "+33%", 4, (118, 200, 90), heavy=True)
+def art_hanoi(sx, sy, sw, sh):
+    base = sy + sh
+    dark = (88, 74, 60)
+    fill_rect(sx + 500, base - 46, 150, 46, dark)
+    fill_rect(sx + 770, base - 36, 130, 36, dark)
+    for wx in range(int(sx) + 516, int(sx) + 624, 28):
+        fill_rect(wx, base - 34, 12, 10, (250, 205, 92))
+    cx, cy = sx + sw * 0.76, sy + sh * 0.40
+    for dx, dy in ((-46, 0), (46, 0), (0, -24), (0, 22), (-34, -17), (34, -17), (-34, 16), (34, 16)):
+        thick_line(cx, cy, cx + dx, cy + dy, 8, (232, 116, 32))
+    fill_circle(cx, cy, 14, (245, 166, 35))
+    for i in range(3):
+        fill_circle(cx + 66 + i * 30, cy - 18 - i * 4, 11 - i * 2, (168, 158, 146))
 
 
-# ------------------------------------------------------------------- build
 PANELS = [
-    ("CONFLICT", "DRONE STRAYS INTO POLAND",
-     "A Russian drone briefly enters Polish airspace during a night attack on western Ukraine.",
-     art_drone, RED),
-    ("SPORT", "WORLD CUP HOSTS NAMED",
-     "FIFA: a USA-led bid gets 2031, the UK gets 2035 - its first World Cup since 1966.",
-     art_worldcup, GREEN),
-    ("CHESS", "TITLE MATCH BEGINS TODAY",
-     "Gukesh defends the crown against Sindarov in Geneva. Game 1 at 15:00 CET, Sindarov White.",
-     art_chess, NAVY),
-    ("SKY", "BEAVER SUPERMOON TONIGHT",
-     "The full moon peaks at 14:53 UTC, near the Pleiades - the first supermoon since January.",
-     art_moon, SKY_D),
-    ("MIDDLE EAST", "GAZA'S LAND POISONED",
-     "Report: the war has left Gaza's soil, air and water toxic for decades to come.",
-     art_gaza, BROWN),
-    ("TECH", "HUANG IS BACK AT NVIDIA",
-     "The board reinstates Jensen Huang as CEO; the shares surge about a third.",
-     art_nvidia, TEAL),
+    {
+        "tag": "CONFLICT · UKRAINE",
+        "head": "RUSSIA HITS ZAPORIZHZHIA",
+        "sub": "OVERNIGHT ATTACK: 2 DEAD, 22 WOUNDED",
+        "accent": (178, 34, 43),
+        "strip": (203, 216, 230),
+        "art": art_ukraine,
+    },
+    {
+        "tag": "CONFLICT · GAZA",
+        "head": "ISRAELI STRIKE KILLS 3 IN GAZA",
+        "sub": "NEAR KHAN YOUNIS POLICE POST, MEDICS SAY",
+        "accent": (146, 64, 32),
+        "strip": (233, 221, 197),
+        "art": art_gaza,
+    },
+    {
+        "tag": "DIPLOMACY · PACIFIC",
+        "head": "SOLOMONS END CHINA PACT",
+        "sub": "CANBERRA TREATY TO REPLACE 2022 BEIJING PACT",
+        "accent": (24, 110, 122),
+        "strip": (170, 206, 222),
+        "art": art_solomons,
+    },
+    {
+        "tag": "MARKETS · ASIA",
+        "head": "ASIA STOCKS JUMP ON TECH RALLY",
+        "sub": "KOSPI +6.3%, NIKKEI +4% IN BROAD TECH SURGE",
+        "accent": (34, 120, 70),
+        "strip": (222, 238, 224),
+        "art": art_markets,
+    },
+    {
+        "tag": "HEALTH · PENNSYLVANIA",
+        "head": "9TH MEASLES DEATH REPORTED",
+        "sub": "OUTBREAK TOPS 1,600 CASES ACROSS 46 COUNTIES",
+        "accent": (150, 40, 90),
+        "strip": (248, 226, 232),
+        "art": art_health,
+    },
+    {
+        "tag": "DISASTER · VIETNAM",
+        "head": "HANOI EXPLOSION KILLS 6",
+        "sub": "10 HURT IN 8 AM BLAST AT FOOD SHOP IN DONG DA",
+        "accent": (196, 110, 20),
+        "strip": (240, 228, 204),
+        "art": art_hanoi,
+    },
 ]
 
 
-def build():
-    p = Poster(W, H, PAPER)
-    # outer frame
-    for t in range(4):
-        p.hline(t, t, W - 2 * t, INK)
-        p.hline(t, H - 1 - t, W - 2 * t, INK)
-        p.vline(t, t, H - 2 * t, INK)
-        p.vline(W - 1 - t, t, H - 2 * t, INK)
+def draw_panels(top, bottom):
+    gap = 22
+    rows = 3
+    ph = (bottom - top - gap * (rows - 1)) / rows
+    pw = (CONTENT_W - gap) / 2
+    for i, panel in enumerate(PANELS):
+        r, c = divmod(i, 2)
+        x = MARGIN + c * (pw + gap)
+        y = top + r * (ph + gap)
+        draw_panel(x, y, pw, ph, panel)
 
-    # masthead
-    p.fill(8, 8, W - 16, 150, NAVY)
-    p.fill(8, 8, W - 16, 4, GOLD)
-    p.fill(8, 154, W - 16, 4, GOLD)
-    p.text(W // 2, 22, "THE WORLD IN ONE DAY", 3, GOLD_L, align="center")
-    p.text(W // 2, 52, "TUESDAY", 5, WHITE, align="center", heavy=True)
-    p.text(W // 2, 96, "24 NOVEMBER 2026", 7, GOLD_L, align="center", heavy=True)
 
-    # panels: 3 columns x 2 rows
-    px0, py0, gap = 16, 172, 12
-    pw = (W - 2 * px0 - 2 * gap) // 3
-    ph = 372
-    for i, (tag, head, body, art, accent) in enumerate(PANELS):
-        col, row = i % 3, i // 3
-        x = px0 + col * (pw + gap)
-        y = py0 + row * (ph + gap)
-        panel_frame(p, x, y, pw, ph, accent)
-        p.set_clip(x + 2, y + 2, pw - 4, 180)
-        art(p, x + 2, y + 2, pw - 4, 180)
-        p.clear_clip()
-        panel_text(p, x, y, pw, tag, head, body, accent)
+def draw_panel(x, y, w, h, panel):
+    fill_rect(x, y, w, h, WHITE)
+    outline_rect(x, y, w, h, 5, INK)
+    accent = panel["accent"]
+    # illustration strip
+    sx, sy, sw, sh = x + 26, y + 18, w - 52, 72
+    fill_rect(sx, sy, sw, sh, panel["strip"])
+    if panel.get("art"):
+        panel["art"](sx, sy, sw, sh)
+    # category tag pill over the strip's top-left corner
+    tag = panel["tag"]
+    tw = text_width(tag, 34) + 40
+    fill_rect(sx + 12, sy + 13, tw, 46, accent)
+    draw_text(sx + 32, sy + 19, tag, 34, WHITE)
+    # headline
+    ty = sy + sh + 14
+    for line in wrap(panel["head"], 76, w - 72):
+        draw_text(x + 36, ty, line, 76, INK)
+        ty += 90
+    # sub-line
+    ty += 2
+    for line in wrap(panel["sub"], 54, w - 72):
+        draw_text(x + 36, ty, line, 54, GREY)
+        ty += 64
 
-    # footer: also today
-    fy = 172 + 2 * ph + gap + 8
-    p.fill(16, fy, W - 32, 46, NAVY)
-    p.text(28, fy + 13, "ALSO TODAY:", 2, GOLD_L, heavy=True)
-    p.text(28 + glyph_width("ALSO TODAY: ", 2) + 8, fy + 13,
-           "Guru Nanak's 557th Prakash Utsav - COP32 next, in Addis Ababa",
-           2, WHITE)
 
-    return p
+# ---------------------------------------------------------------- png out
+
+def downscale():
+    """Box-downscale the 2048 buffer to 1024 (2x2 average)."""
+    out = bytearray(OUT * OUT * 3)
+    for oy in range(OUT):
+        r0 = (oy * 2) * SS * 3
+        r1 = r0 + SS * 3
+        a = bytes(buf[r0:r0 + SS * 3])
+        b = bytes(buf[r1:r1 + SS * 3])
+        base = oy * OUT * 3
+        for ch in range(3):
+            s0 = a[ch::3]
+            s1 = b[ch::3]
+            vals = bytes((s0[i] + s0[i + 1] + s1[i] + s1[i + 1]) // 4
+                         for i in range(0, SS, 2))
+            out[base + ch:base + OUT * 3:3] = vals
+    return bytes(out)
+
+
+def write_png(path, pixels):
+    raw = bytearray()
+    stride = OUT * 3
+    for yy in range(OUT):
+        raw.append(0)
+        raw += pixels[yy * stride:(yy + 1) * stride]
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", OUT, OUT, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as fh:
+        fh.write(png)
 
 
 def main():
+    fill_rect(0, 0, SS, SS, PAPER)
+    top = masthead()
+    bottom = SS - 270
+    draw_panels(top, bottom)
+    footer(bottom + 18)
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    poster = build()
-    path = os.path.join(out_dir, "entry.png")
-    size = write_png(poster, path)
-    print("wrote %s (%d bytes)" % (path, size))
+    write_png(os.path.join(out_dir, "entry.png"), downscale())
 
 
 if __name__ == "__main__":
